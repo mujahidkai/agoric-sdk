@@ -46,9 +46,12 @@ export interface KmsSigningClient {
   >;
 }
 
-/** Type URL + amino type for the one Agoric message this POC broadcasts. */
+/** Type URL for the Agoric wallet spend-action message this POC broadcasts. */
 export const AGORIC_WALLET_SPEND_ACTION_TYPE_URL =
   '/agoric.swingset.MsgWalletSpendAction';
+
+/** Type URL for the Agoric smart-wallet provisioning message. */
+export const AGORIC_PROVISION_TYPE_URL = '/agoric.swingset.MsgProvision';
 
 /** Apply the ambient `harden` when a lockdown has installed it; else identity. */
 const maybeHarden = <T>(value: T): T => {
@@ -245,10 +248,11 @@ export interface MakeStargateClientKitOptions extends MakeKmsDirectSignerOptions
 
 /**
  * Build a `SigningStargateClient` over the KMS signer with a registry that
- * knows `MsgWalletSpendAction`, returning the `{ address, client }` shape that
- * the mnemonic-based path returns — a straight substitute.
+ * knows `MsgWalletSpendAction` and `MsgProvision`, returning the
+ * `{ address, client }` shape that the mnemonic-based path returns — a straight
+ * substitute.
  *
- * The Agoric message type is loaded lazily from the published
+ * The Agoric message types are loaded lazily from the published
  * `@agoric/cosmic-proto` so this module stays importable (for the pure unit
  * tests above) without a built copy of the workspace package.
  */
@@ -265,7 +269,7 @@ export const makeStargateClientKitFromKms = async ({
   const signer = await makeKmsDirectSigner({ keyVersionName, prefix, kmsClient });
   const [{ address }] = await signer.getAccounts();
 
-  const { MsgWalletSpendAction } = await import(
+  const { MsgWalletSpendAction, MsgProvision } = await import(
     '@agoric/cosmic-proto/agoric/swingset/msgs.js'
   );
   const registry = new Registry([
@@ -273,6 +277,7 @@ export const makeStargateClientKitFromKms = async ({
       AGORIC_WALLET_SPEND_ACTION_TYPE_URL,
       MsgWalletSpendAction as GeneratedType,
     ],
+    [AGORIC_PROVISION_TYPE_URL, MsgProvision as GeneratedType],
   ]);
 
   const client = await connectWithSigner(rpcAddr, signer, { registry });
