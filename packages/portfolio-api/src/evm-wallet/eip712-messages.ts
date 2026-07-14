@@ -75,6 +75,30 @@ const OperationTypes = {
     { name: 'allocations', type: 'Allocation[]' },
     { name: 'features', type: 'PortfolioAutoFeatures' },
   ],
+  /**
+   * Open a portfolio and, in the same signed message, grant portfolio
+   * permissions to an automation agent's Agoric address. This collapses the
+   * former two-step "create portfolio" + "Grant" flow into a single user
+   * signature: the contract creates the portfolio with the given allocations
+   * and then delivers the delegation to `accountHolder`, exactly as a
+   * standalone {@link Grant} would.
+   *
+   * Like {@link OpenPortfolio}, this is a permit2-wrapped (funds-bearing)
+   * operation; the accompanying Permit2 supplies the initial deposit.
+   *
+   * - allocations: initial target allocation across instruments
+   * - accountHolder: the delegation grantee — the bech32 Agoric address that
+   *   receives the granted portfolio permissions. The field name mirrors the
+   *   standalone {@link Grant} op for cross-op consistency; despite the generic
+   *   name it is specifically the grant recipient, not the portfolio owner
+   *   (the owner is the signing EVM account, carried by the Permit2 envelope).
+   * - permissions: encoded portfolio permissions (see PortfolioPermissions)
+   */
+  OpenPortfolioWithGrant: [
+    { name: 'allocations', type: 'Allocation[]' },
+    { name: 'accountHolder', type: 'string' },
+    { name: 'permissions', type: 'PortfolioPermissions' },
+  ],
   Rebalance: [PortfolioIdParam],
   SetTargetAllocation: [
     { name: 'allocations', type: 'Allocation[]' },
