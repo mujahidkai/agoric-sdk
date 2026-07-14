@@ -790,6 +790,21 @@ export const contract = async (
     /**
      * Open a portfolio for EVM users with a signed Permit2 deposit.
      *
+     * If `data` includes `accountHolder`, this also performs the combined
+     * open+grant flow: delegate control to that Agoric address in the same
+     * signed message, reusing the same authorization and validation as a
+     * standalone `grant()`.
+     *
+     * Ordering guarantee: a rejected combined grant aborts before the funding
+     * flow starts, so no deposit is pulled. The
+     * `open+grant with an unregistered accountHolder aborts and pulls no
+     * deposit` test pins that behavior.
+     *
+     * Non-guarantee: this is not fully atomic. The portfolio kit is created
+     * before the grant is attempted, so a rejected grant can orphan an
+     * unfunded shell portfolio. Funding is also still fire-and-forget, so a
+     * later funding failure can leave a delegated-but-unfunded portfolio.
+     *
      * @returns storagePath (vstorage) and evmHandler facet
      *
      * @see {@link openPortfolio} for the flow implementation
@@ -797,7 +812,8 @@ export const contract = async (
     async openPortfolioFromEVM(
       data:
         | YmaxOperationDetails<'OpenPortfolio'>['data']
-        | YmaxOperationDetails<'OpenPortfolioWithAutoFeatures'>['data'],
+        | YmaxOperationDetails<'OpenPortfolioWithAutoFeatures'>['data']
+        | YmaxOperationDetails<'OpenPortfolioWithGrant'>['data'],
       permitDetails: PermitDetails,
     ): Promise<{
       storagePath: string;
@@ -834,6 +850,21 @@ export const contract = async (
       if ('features' in data && data.features !== undefined) {
         // setAutoFeatures is promptly resolved
         await vowTools.asPromise(kit.evmHandler.setAutoFeatures(data.features));
+      }
+      if ('accountHolder' in data && data.accountHolder !== undefined) {
+        // `grant()` already enforces the shared auth and permission checks.
+        // `asPromise()` is safe because grant delivery is prompt: it hands the
+        // invitation to an already-provisioned smart wallet via
+        // `deliverDelegation` / `NamesByAddress`, so success resolves promptly
+        // and an unregistered grantee rejects promptly too.
+        await vowTools.asPromise(
+          // cast from EIP-712 string to agoric1 Bech32 address, as in the
+          // standalone Grant handler; the string is looked up in NamesByAddress.
+          kit.evmHandler.grant(
+            data.accountHolder as Bech32Address,
+            data.permissions,
+          ),
+        );
       }
 
       const seat = zcf.makeEmptySeatKit().zcfSeat;
