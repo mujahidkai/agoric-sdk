@@ -1,0 +1,224 @@
+# Design: MCP server for KMS-backed Agoric agent-wallet signing on GCP
+
+Job `20260716T120327Z-kernighan`. Builds on research-brief.md
+(`lab/research/20260716T115350Z-shamir`), the approved POC design
+`designs/kms-backed-agoric-signing.md`, and `services/kms-signer-poc/`.
+Authoritative human decisions (2026-07-16) override the brief where they differ:
+Neon (Postgres) store, token-carried user+agent addresses with server-side tx
+build, and isolation Model A.
+
+## Goal
+
+Ship a new self-contained unit `services/mcp-agent-signer/` (a Cloud Run MCP
+server) that mints per-user agent wallets as non-exportable GCP KMS
+secp256k1 keys and signs/broadcasts Agoric transactions on their behalf. No
+existing agoric-sdk package is modified. Funding, key-ring creation, and the
+concrete authN/authZ implementation stay out of scope.
+
+## Approach
+
+- Reuse the POC signer core verbatim: factor `kms-direct-signer.ts`
+  (`makeKmsDirectSigner`, `makeStargateClientKitFromKms`,
+  `compressedPubkeyFromPem`, `addressFromCompressedPubkey`) and
+  `KMS_KEY_VERSION_PATTERN` into an internal module of the new unit (copy/vendor;
+  do not import across into the POC package). Same repo conventions: ESM TS,
+  `tsc -p tsconfig.build.json`, ava via `ts-blank-space/register`, `@aglocal/*`
+  private name, published deps only, node `^22.11`, best-effort `harden()`.
+- Runtime: a Cloud Run **service** (long-lived), not the POC gen2 function,
+  running an `@modelcontextprotocol/sdk` server over **Streamable HTTP** at
+  `/mcp`. Deploy with `--no-allow-unauthenticated`; callers need
+  `roles/run.invoker`. Identity/ADC/KMS story is identical to the POC.
+
+## Auth model (confirmed decision 2)
+
+- One seam: `getVerifiedAuth(request) -> { userAddress, agentAddress }`. The
+  verified token carries BOTH the authenticated user-addr and the agent-addr.
+  Clients NEVER pass an opaque agentId, NEVER a key name, and NEVER a
+  pre-serialized tx / spendAction payload.
+- The MCP tool builds `MsgWalletSpendAction` SERVER-SIDE from structured intent
+  args: it serializes the spendAction string itself, sets `owner` = the agent
+  address (bytes), and signs. `provision` builds `MsgProvision` likewise.
+- The server MUST still verify `record.owner_user_address === token.userAddress`
+  against the store before signing (belt-and-suspenders, and required anyway to
+  resolve `keyVersion` — KMS has no reverse address->key lookup).
+
+## Store (confirmed decision 1)
+
+- Existing **Neon (Postgres)** instance is the authZ source of truth (replaces
+  the brief's Firestore and the POC's `KMS_KEY_VERSIONS` env roster). Co-locate
+  same-region with the Cloud Run service.
+- Access via Neon's **pooled endpoint (PgBouncer)** or the **serverless driver
+  (HTTP/WS)** — never a naive per-instance TCP pool (Cloud Run scales to many
+  short-lived instances). Connection string from Secret Manager.
+- Table `agent_wallets`:
+  `agent_address PK, owner_user_address, key_version (KMS resource name),
+   prefix, protection_level, status (pending|enabled|disabled), label,
+   created_at`. Enforce one-key-per-agent idempotency with
+  `UNIQUE(owner_user_address, agent_address)`.
+
+## MCP tools (each scopes to the token's userAddress)
+
+- `create_agent_wallet(label?)` — mint a KMS key on demand (below), derive
+  address, insert row, return `{ agentAddress, address }`.
+- `list_agent_wallets()` — `SELECT ... WHERE owner_user_address = userAddress`.
+- `get_agent_wallet()` — address + on-chain balance for the token's agent.
+- `provision_wallet()` — build+broadcast `MsgProvision` for the token's agent.
+- `sign_and_broadcast(intent)` — build `MsgWalletSpendAction` from structured
+  intent for the token's agent, sign via KMS, broadcast over Agoric RPC.
+
+## On-demand key/version creation (Q1)
+
+Reuse the `docs/on-demand-wallets.md` sketch: factory
+`createCryptoKey({ purpose: ASYMMETRIC_SIGN, versionTemplate: {
+EC_SIGN_SECP256K1_SHA256, protectionLevel } })` (one key per agent) →
+poll `getCryptoKeyVersion` with bounded backoff until `state === ENABLED` →
+`getPublicKey` → `compressedPubkeyFromPem` → `addressFromCompressedPubkey`
+→ insert row → return. Use a deterministic `cryptoKeyId` and dedupe on the
+UNIQUE constraint so a client retry never mints an orphan key (KMS key material
+can only be scheduled for destruction, never deleted). Mind KMS create/list quotas.
+
+## IAM least-privilege (Q2 — default: ring-level)
+
+- **Signing SA** (MCP service runtime, hot path): `roles/cloudkms.signerVerifier`
+  only, scoped at the **key ring** (granted once by IaC). New keys inherit it, so
+  the create path needs no runtime `setIamPolicy`. No admin, ever.
+- **Factory identity** (create path): create-only
+  (`cloudkms.cryptoKeys.create` + `cryptoKeyVersions.create` + `getPublicKey`),
+  a custom role rather than broad `roles/cloudkms.admin`. Default placement: the
+  MCP service **impersonates** a dedicated factory SA
+  (`roles/iam.serviceAccountTokenCreator`) only for the create call, keeping
+  admin off the always-on identity. (Alternative: a separate factory Cloud Run
+  service — stronger isolation; flagged for design review.)
+
+## Isolation (Q4 — confirmed decision 3: Model A)
+
+Model A (application-layer authZ) is chosen; Model B is not designed for.
+Cross-agent denial: extract `userAddress` + `agentAddress` from the verified
+token → look up `agent_address` in Neon → if
+`record.owner_user_address !== token.userAddress`, return **403 BEFORE**
+resolving `keyVersion` or calling KMS. Defense-in-depth: clients cannot name
+keys; the signer's built-in `signerAddress === address` assertion; Cloud Audit
+Logs on KMS sign ops. **Model C (per-tenant key rings)** is documented as the
+production hardening path (per-tenant ring + ring-scoped signerVerifier).
+
+## Sequence diagrams
+
+These illustrate the flows above under the confirmed token model (Neon store,
+token-carried user+agent addresses, server-side tx build, Model A isolation).
+Documentation only; they add no new design substance.
+
+### 1. Create an agent wallet on demand
+
+```mermaid
+sequenceDiagram
+    participant C as MCP client
+    participant S as MCP server (Cloud Run, signer SA)
+    participant A as auth seam (verify token)
+    participant F as Wallet factory (admin SA, impersonated)
+    participant K as GCP KMS
+    participant N as Neon (Postgres)
+
+    C->>S: tool create_agent_wallet(label?)
+    S->>A: getVerifiedAuth(request)
+    A-->>S: { userAddress }
+    %% impersonate factory SA
+    S->>F: createWallet(userAddress, label)
+    F->>K: createCryptoKey(ASYMMETRIC_SIGN, EC_SIGN_SECP256K1_SHA256)
+    K-->>F: cryptoKeyVersion (PENDING_GENERATION)
+    loop bounded backoff until ENABLED
+        F->>K: getCryptoKeyVersion(state?)
+    end
+    F->>K: getPublicKey(keyVersion)
+    K-->>F: PEM public key
+    F->>F: compressedPubkeyFromPem -> addressFromCompressedPubkey (agoric1 agentAddress)
+    Note over F,K: ring-level signerVerifier already granted by IaC, no runtime setIamPolicy
+    F->>N: INSERT agent_wallets { agent_address, owner_user_address=userAddress, key_version, ... }
+    Note over F,N: UNIQUE(owner_user_address, agent_address) makes retries idempotent
+    N-->>F: ok
+    F-->>S: { agentAddress, address }
+    S-->>C: { agentAddress, address }
+```
+
+### 2. Sign and broadcast a transaction
+
+```mermaid
+sequenceDiagram
+    participant C as MCP client
+    participant S as MCP server (signer SA)
+    participant A as auth seam (verify token)
+    participant N as Neon (Postgres)
+    participant K as GCP KMS
+    participant R as Agoric RPC
+
+    %% structured args only, no client tx
+    C->>S: tool sign_and_broadcast(intent)
+    S->>A: getVerifiedAuth(request)
+    A-->>S: { userAddress, agentAddress }
+    S->>N: SELECT ... WHERE agent_address = token.agentAddress
+    N-->>S: { owner_user_address, key_version }
+    alt owner_user_address != token.userAddress
+        %% isolation enforced here, before KMS
+        S-->>C: 403 not your agent
+    else authorized
+        S->>S: build MsgWalletSpendAction server-side from intent (owner = agentAddress bytes)
+        S->>R: fetch account / sequence
+        S->>K: asymmetricSign(keyVersion, sha256(signBytes))
+        K-->>S: DER signature (low-S)
+        S->>R: broadcast MsgWalletSpendAction
+        R-->>S: { transactionHash, code }
+        S-->>C: { address, transactionHash, code }
+    end
+```
+
+### 3. Cross-agent denial (the Model A guarantee)
+
+```mermaid
+sequenceDiagram
+    participant C as MCP client (user Alice)
+    participant S as MCP server
+    participant A as auth seam (verify token)
+    participant N as Neon (Postgres)
+
+    C->>S: sign_and_broadcast(intent)
+    S->>A: getVerifiedAuth(request)
+    %% X is Bob's agent
+    A-->>S: { userAddress: Alice, agentAddress: X }
+    S->>N: SELECT ... WHERE agent_address = X
+    N-->>S: { owner_user_address: Bob }
+    Note over S: token.userAddress=Alice != owner_user_address=Bob
+    S-->>C: 403 forbidden (no keyVersion resolution, no KMS call)
+```
+
+## Files to add (all under `services/mcp-agent-signer/`)
+
+`package.json`, `tsconfig*.json`, `src/server.ts` (MCP + Streamable HTTP),
+`src/tools.ts`, `src/auth.ts` (`getVerifiedAuth` seam), `src/store.ts` (Neon),
+`src/factory.ts` (KMS create + poll), `src/signer/*` (vendored POC core),
+`src/config.ts`, `test/*.test.ts`, `README.md`, IaC notes. No changes outside
+this directory.
+
+## Edge cases
+
+- Version stuck `PENDING_GENERATION`: bounded backoff then error; row stays
+  `pending`, retry idempotent via UNIQUE.
+- Retry / duplicate create: deterministic id + UNIQUE → no orphan keys.
+- Agent unfunded: fee check before provision/spend (as POC), clear error.
+- Token agent-addr absent from store: 404 (not 403) — no ownership leak.
+- Neon cold-start / pooler saturation: use pooled/serverless driver; fail fast.
+
+## Test plan
+
+- Unit (ava, no cloud): address derivation from a fixed PEM; store ownership
+  check returns 403 before any KMS/keyVersion resolution (inject fake store);
+  server-side `MsgWalletSpendAction` build from intent (owner bytes correct);
+  auth seam rejects missing/omitted agent-addr; UNIQUE-violation → idempotent
+  create. Inject fake KMS + fake `connectWithSigner` (as POC tests do).
+- Manual: deploy to Cloud Run `--no-allow-unauthenticated`, exercise
+  create→provision→spend against a testnet RPC.
+
+## Out of scope
+
+Funding wallets; key-**ring** creation (IaC/manual); the concrete authN/authZ
+implementation (token verification is a black box — assume trusted
+user+agent addr); modifying any agoric-sdk package or carrying anything to
+upstream; key rotation, DR, multi-region (noted only).
