@@ -101,6 +101,90 @@ keys; the signer's built-in `signerAddress === address` assertion; Cloud Audit
 Logs on KMS sign ops. **Model C (per-tenant key rings)** is documented as the
 production hardening path (per-tenant ring + ring-scoped signerVerifier).
 
+## Sequence diagrams
+
+These illustrate the flows above under the confirmed token model (Neon store,
+token-carried user+agent addresses, server-side tx build, Model A isolation).
+Documentation only; they add no new design substance.
+
+### 1. Create an agent wallet on demand
+
+```mermaid
+sequenceDiagram
+    participant C as MCP client
+    participant S as MCP server (Cloud Run, signer SA)
+    participant A as auth seam (verify token)
+    participant F as Wallet factory (admin SA, impersonated)
+    participant K as GCP KMS
+    participant N as Neon (Postgres)
+
+    C->>S: tool create_agent_wallet(label?)
+    S->>A: getVerifiedAuth(request)
+    A-->>S: { userAddress }
+    S->>F: createWallet(userAddress, label)  %% impersonate factory SA
+    F->>K: createCryptoKey(ASYMMETRIC_SIGN, EC_SIGN_SECP256K1_SHA256)
+    K-->>F: cryptoKeyVersion (PENDING_GENERATION)
+    loop bounded backoff until ENABLED
+        F->>K: getCryptoKeyVersion(state?)
+    end
+    F->>K: getPublicKey(keyVersion)
+    K-->>F: PEM public key
+    F->>F: compressedPubkeyFromPem -> addressFromCompressedPubkey (agoric1 agentAddress)
+    Note over F,K: ring-level signerVerifier already granted by IaC; no runtime setIamPolicy
+    F->>N: INSERT agent_wallets { agent_address, owner_user_address=userAddress, key_version, ... }
+    Note over F,N: UNIQUE(owner_user_address, agent_address) makes retries idempotent
+    N-->>F: ok
+    F-->>S: { agentAddress, address }
+    S-->>C: { agentAddress, address }
+```
+
+### 2. Sign and broadcast a transaction
+
+```mermaid
+sequenceDiagram
+    participant C as MCP client
+    participant S as MCP server (signer SA)
+    participant A as auth seam (verify token)
+    participant N as Neon (Postgres)
+    participant K as GCP KMS
+    participant R as Agoric RPC
+
+    C->>S: tool sign_and_broadcast(intent)  %% structured args only, no client tx
+    S->>A: getVerifiedAuth(request)
+    A-->>S: { userAddress, agentAddress }
+    S->>N: SELECT ... WHERE agent_address = token.agentAddress
+    N-->>S: { owner_user_address, key_version }
+    alt owner_user_address != token.userAddress
+        S-->>C: 403 not your agent   %% isolation enforced here, before KMS
+    else authorized
+        S->>S: build MsgWalletSpendAction server-side from intent (owner = agentAddress bytes)
+        S->>R: fetch account / sequence
+        S->>K: asymmetricSign(keyVersion, sha256(signBytes))
+        K-->>S: DER signature (low-S)
+        S->>R: broadcast MsgWalletSpendAction
+        R-->>S: { transactionHash, code }
+        S-->>C: { address, transactionHash, code }
+    end
+```
+
+### 3. Cross-agent denial (the Model A guarantee)
+
+```mermaid
+sequenceDiagram
+    participant C as MCP client (user Alice)
+    participant S as MCP server
+    participant A as auth seam (verify token)
+    participant N as Neon (Postgres)
+
+    C->>S: sign_and_broadcast(intent)
+    S->>A: getVerifiedAuth(request)
+    A-->>S: { userAddress: Alice, agentAddress: X }  %% X is Bob's agent
+    S->>N: SELECT ... WHERE agent_address = X
+    N-->>S: { owner_user_address: Bob }
+    Note over S: token.userAddress=Alice != owner_user_address=Bob
+    S-->>C: 403 forbidden (no keyVersion resolution, no KMS call)
+```
+
 ## Files to add (all under `services/mcp-agent-signer/`)
 
 `package.json`, `tsconfig*.json`, `src/server.ts` (MCP + Streamable HTTP),
