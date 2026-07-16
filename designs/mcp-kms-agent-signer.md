@@ -121,7 +121,8 @@ sequenceDiagram
     C->>S: tool create_agent_wallet(label?)
     S->>A: getVerifiedAuth(request)
     A-->>S: { userAddress }
-    S->>F: createWallet(userAddress, label)  %% impersonate factory SA
+    %% impersonate factory SA
+    S->>F: createWallet(userAddress, label)
     F->>K: createCryptoKey(ASYMMETRIC_SIGN, EC_SIGN_SECP256K1_SHA256)
     K-->>F: cryptoKeyVersion (PENDING_GENERATION)
     loop bounded backoff until ENABLED
@@ -130,7 +131,7 @@ sequenceDiagram
     F->>K: getPublicKey(keyVersion)
     K-->>F: PEM public key
     F->>F: compressedPubkeyFromPem -> addressFromCompressedPubkey (agoric1 agentAddress)
-    Note over F,K: ring-level signerVerifier already granted by IaC; no runtime setIamPolicy
+    Note over F,K: ring-level signerVerifier already granted by IaC, no runtime setIamPolicy
     F->>N: INSERT agent_wallets { agent_address, owner_user_address=userAddress, key_version, ... }
     Note over F,N: UNIQUE(owner_user_address, agent_address) makes retries idempotent
     N-->>F: ok
@@ -149,13 +150,15 @@ sequenceDiagram
     participant K as GCP KMS
     participant R as Agoric RPC
 
-    C->>S: tool sign_and_broadcast(intent)  %% structured args only, no client tx
+    %% structured args only, no client tx
+    C->>S: tool sign_and_broadcast(intent)
     S->>A: getVerifiedAuth(request)
     A-->>S: { userAddress, agentAddress }
     S->>N: SELECT ... WHERE agent_address = token.agentAddress
     N-->>S: { owner_user_address, key_version }
     alt owner_user_address != token.userAddress
-        S-->>C: 403 not your agent   %% isolation enforced here, before KMS
+        %% isolation enforced here, before KMS
+        S-->>C: 403 not your agent
     else authorized
         S->>S: build MsgWalletSpendAction server-side from intent (owner = agentAddress bytes)
         S->>R: fetch account / sequence
@@ -178,7 +181,8 @@ sequenceDiagram
 
     C->>S: sign_and_broadcast(intent)
     S->>A: getVerifiedAuth(request)
-    A-->>S: { userAddress: Alice, agentAddress: X }  %% X is Bob's agent
+    %% X is Bob's agent
+    A-->>S: { userAddress: Alice, agentAddress: X }
     S->>N: SELECT ... WHERE agent_address = X
     N-->>S: { owner_user_address: Bob }
     Note over S: token.userAddress=Alice != owner_user_address=Bob
